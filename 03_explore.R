@@ -4,23 +4,40 @@
 # Author: Adam Walker
 # Date: May 2019
 # Description: Explore some YouTube trending video data
-# Includes some initial data summaries and plots, with more fleshed out visuals later on
+# Includes some initial data summaries and plots, with bootstrap intervals and quick regression at end
 ##############################################
 
 rm(list=ls())
 gc()
 
+# General
 library(ggplot2)
 library(dplyr)
 
+# Language detection
 library(cld3)
 library(textcat)
 
+# Tags and graphs
 library(tidytext)
 library(tidyr)
 library(widyr)
 library(igraph)
 library(ggraph)
+
+# Bootstrap estimates, marginal effects
+library(bcaboot)
+library(margins)
+
+# Install any missing packages
+package_list <- c('ggplot2', 'dplyr', 'cld3', 'textcat', 'tidytext', 'tidyr', 'widyr', 'igraph', 'ggraph', 'bcaboot', 'margins')
+for( p in package_list ){
+  print( p )
+  if( suppressWarnings( !require( p, character.only = TRUE ) ) ){ # Check if package available
+    install.packages( p, character.only = TRUE ) # Install if missing
+    library( p, character.only = TRUE )
+  }
+}
 
 # Disable scientific notation
 options(scipen=999)
@@ -47,7 +64,7 @@ tag.df <- readRDS(file = paste0(path,"tag_df.rds"))
 glimpse(video.df)
 summary(video.df)
 video.df %>% head(30)
-View( video.df %>% head(30) )
+# View( video.df %>% head(30) )
 
 glimpse(tag.df)
 summary(tag.df)
@@ -69,7 +86,7 @@ video.df %>% select(-favoriteCount) -> video.df
 # Check NAs by column
 na_count <- sapply(video.df, function(y) sum(length(which(is.na(y)))) )
 na_count
-View( video.df %>% filter(is.na(video_id)) )
+# View( video.df %>% filter(is.na(video_id)) )
 
 # Remove NA ids
 # Often would want to rename df here
@@ -84,11 +101,9 @@ head( video.df[,1:15] )
 video.df$viewCount <- as.numeric( video.df$viewCount )
 video.df$likeCount <- as.numeric( video.df$likeCount )
 video.df$dislikeCount <- as.numeric( video.df$dislikeCount )
-video.df$favoriteCount <- as.numeric( video.df$favoriteCount )
 video.df$commentCount <- as.numeric( video.df$commentCount )
 video.df$category <- as.numeric( video.df$category )
-
-View( video.df %>% filter( is.na(likeCount) ) )
+# View( video.df %>% filter( is.na(likeCount) ) )
 
 # Flag if likes/dislikes disabled
 video.df$likes_disabled <- ifelse( is.na(video.df$likeCount), 1, 0 )
@@ -162,6 +177,9 @@ summary( video.df$like_ratio_log )
 ggplot( video.df, aes( like_ratio_log ) ) +
   geom_histogram()
 # That's looking like a distribution we can work with!
+
+# (still not normal though)
+shapiro.test( sample(video.df$like_ratio_log, 5000) )
 
 # Most positive
 video.df %>%
@@ -339,3 +357,93 @@ video.df %>%
   select( title ) %>%
   head(20)
 
+
+######################
+# BOOTSTRAP INTERVALS
+######################
+
+# What's a bootstrap CI for median trending video favorability?
+rfun <- function(x) { median(x, na.rm = TRUE) }
+result <- bcajack(x = video.df$like_ratio_log, B = 2000, func = rfun, verbose = TRUE)
+result$lims
+
+# For the mean
+rfun <- function(x) { mean(x, na.rm = TRUE) }
+result <- bcajack(x = video.df$like_ratio_log, B = 2000, func = rfun, verbose = TRUE)
+result$lims
+
+
+######################
+# REGRESSION
+######################
+
+video.df %>% 
+  filter( !is.na(like_ratio_log) ) %>%
+  filter( commentCount > 0 ) -> video.df.mod.input
+
+# Format some variables for the model
+video.df.mod.input$category <- as.factor( video.df.mod.input$category )
+video.df.mod.input$seconds_log <- log(video.df.mod.input$seconds)
+video.df.mod.input$viewCount_log <- log(video.df.mod.input$viewCount)
+video.df.mod.input$comments_per_view <- video.df.mod.input$commentCount / video.df.mod.input$viewCount
+video.df.mod.input$licensedContent <- ifelse(video.df.mod.input$licensedContent==TRUE,1,0)
+
+# Check correlations
+cor(video.df.mod.input %>% select_if(is.numeric))
+cor(video.df.mod.input %>% select_if(is.numeric), method = "pearson")[,"like_ratio_log"]
+
+ggplot( video.df.mod.input, aes(like_ratio_log, seconds_log) ) +
+  geom_point()
+
+# Keep top 10 languages, convert rest to all other bucket
+video.df.mod.input %>% group_by(detected_language_cld3) %>%
+  summarise(total=n()) %>% arrange(desc(total)) %>% pull(detected_language_cld3) %>%
+  head(10) -> top.10.languages
+video.df.mod.input$top_languages <- ifelse( video.df.mod.input$detected_language_cld3 %in% top.10.languages, video.df.mod.input$detected_language_cld3, "other" )
+
+# Fit model
+mod <- lm( like_ratio_log ~ licensedContent 
+           + definition
+           + category
+           + caption
+           + seconds_log
+           + top_languages
+           + comments_per_view
+           + viewCount_log
+           , data = video.df.mod.input )
+summary( mod )
+
+# Check regression diagnostics
+par(mfrow=c(2,2))
+plot( mod )
+par(mfrow=c(1,1))
+
+# Have a major outlier
+video.df.mod.input[4025,]
+# https://www.youtube.com/watch?v=tHIeDMSzvK4
+
+# Remove and rerun
+video.df.mod.input <- video.df.mod.input[-4025,]
+mod <- lm( like_ratio_log ~ licensedContent 
+           + definition
+           + category
+           + caption
+           + seconds_log
+           + top_languages
+           + comments_per_view
+           + viewCount_log
+           , data = video.df.mod.input )
+summary( mod )
+
+# Highly negative sentiment - looks like a news category
+video.df.mod.input %>%
+  filter( category==11& detected_language_cld3=='en' ) %>%
+  arrange( desc(viewCount) ) %>%
+  select( title ) %>%
+  head(10)
+
+# Look at predictions across range of variable, using margins package
+# https://cran.r-project.org/web/packages/margins/vignettes/Introduction.html
+cplot(mod, "comments_per_view", what = "prediction", main = "Predicted Favorability, Given Comments Per View")
+cplot(mod, "viewCount_log", what = "prediction", main = "Predicted Favorability, Given Log View Count")
+cplot(mod, "seconds_log", what = "prediction", main = "Predicted Favorability, Given Log Seconds")
